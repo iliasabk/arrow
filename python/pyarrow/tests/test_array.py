@@ -621,6 +621,22 @@ def test_arange():
     with pytest.raises(pa.ArrowInvalid):
         pa.arange(0, 10, 0)
 
+    # GH-51393: extreme ranges must not overflow the signed length
+    # computation (and crash the process); ArrowInvalid is raised instead
+    with pytest.raises(pa.ArrowInvalid):
+        pa.arange(-(1 << 63), 0)
+    with pytest.raises(pa.ArrowInvalid):
+        pa.arange((1 << 63) - 1, -(1 << 63), -1)
+    with pytest.raises(pa.ArrowInvalid):
+        pa.arange(0, 1 << 60)
+
+    # Boundary values still work when the range itself is small
+    result = pa.arange(-(1 << 63), -(1 << 63) + 3)
+    result.validate(full=True)
+    assert result.equals(
+        pa.array([-(1 << 63), -(1 << 63) + 1, -(1 << 63) + 2],
+                 type=pa.int64()))
+
 
 def test_array_diff():
     # ARROW-6252
