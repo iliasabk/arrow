@@ -43,6 +43,7 @@
 #include "arrow/util/decimal.h"
 #include "arrow/util/hash_util.h"
 #include "arrow/util/hashing.h"
+#include "arrow/util/io_util.h"
 #include "arrow/util/key_value_metadata.h"
 #include "arrow/util/logging_internal.h"
 #include "arrow/util/range.h"
@@ -1330,9 +1331,37 @@ bool RunEndEncodedType::RunEndTypeValid(const DataType& run_end_type) {
 
 namespace {
 
-std::unordered_multimap<std::string_view, int> CreateNameToIndexMap(
-    const FieldVector& fields) {
-  std::unordered_multimap<std::string_view, int> name_to_index;
+// Field names can be attacker-controlled, for example when a Schema is built
+// from an untrusted Parquet/Arrow-IPC/Feather file.  With a fixed, publicly
+// known hash function an attacker can pick many distinct names that land in
+// the same bucket and make map construction (and lookups) approach quadratic
+// time (GH-51389).  The map is a purely in-memory lookup structure that is
+// never serialized, so a per-process random seed is sufficient.
+uint64_t FieldNameHashSeed() {
+  static const uint64_t seed = [] {
+    const int64_t s = internal::GetRandomSeed();
+    // XXH3 treats a zero seed as unseeded; fall back to a fixed non-zero
+    // constant if the platform fails to provide entropy.
+    return s != 0 ? static_cast<uint64_t>(s) : uint64_t{0x9e3779b97f4a7c15};
+  }();
+  return seed;
+}
+
+// Seeded hasher for the field-name -> index maps.  The seed enters the hash
+// computation itself (seeded XXH3), so colliding names cannot be precomputed
+// without knowledge of the process seed.
+struct FieldNameHash {
+  size_t operator()(const std::string_view name) const {
+    return static_cast<size_t>(
+        XXH3_64bits_withSeed(name.data(), name.size(), FieldNameHashSeed()));
+  }
+};
+
+using FieldNameIndex =
+    std::unordered_multimap<std::string_view, int, FieldNameHash>;
+
+FieldNameIndex CreateNameToIndexMap(const FieldVector& fields) {
+  FieldNameIndex name_to_index;
   name_to_index.reserve(fields.size());
   for (size_t i = 0; i < fields.size(); ++i) {
     const std::string_view name = fields[i]->name();
@@ -1343,7 +1372,7 @@ std::unordered_multimap<std::string_view, int> CreateNameToIndexMap(
 }
 
 template <int NotFoundValue = -1, int DuplicateFoundValue = -1>
-int LookupNameIndex(const std::unordered_multimap<std::string_view, int>& name_to_index,
+int LookupNameIndex(const FieldNameIndex& name_to_index,
                     std::string_view name) {
   auto p = name_to_index.equal_range(name);
   auto it = p.first;
@@ -1366,7 +1395,7 @@ class StructType::Impl {
   explicit Impl(const FieldVector& fields)
       : name_to_index_(CreateNameToIndexMap(fields)) {}
 
-  const std::unordered_multimap<std::string_view, int> name_to_index_;
+  const FieldNameIndex name_to_index_;
 };
 
 StructType::StructType(const FieldVector& fields)
@@ -2283,7 +2312,7 @@ class Schema::Impl {
 
   FieldVector fields_;
   Endianness endianness_;
-  std::unordered_multimap<std::string_view, int> name_to_index_;
+  FieldNameIndex name_to_index_;
   std::shared_ptr<const KeyValueMetadata> metadata_;
 };
 
@@ -2586,7 +2615,7 @@ class SchemaBuilder::Impl {
 
  private:
   FieldVector fields_;
-  std::unordered_multimap<std::string_view, int> name_to_index_;
+  FieldNameIndex name_to_index_;
   std::shared_ptr<const KeyValueMetadata> metadata_;
   ConflictPolicy policy_;
   Field::MergeOptions field_merge_options_;
